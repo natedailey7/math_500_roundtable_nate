@@ -21,7 +21,7 @@ See docs example in section 5.2.3. :contentReference[oaicite:2]{index=2}
 """
 
 # =========================
-# CONFIG — edit these paths
+# CONFIG
 # =========================
 DEM_PATH          = r"data\dem_processed\dem_resampled.tif"
 FUEL_MODEL_PATH   = r"data\LF\LF_aoi.tif"      # integer codes like 101=GR1, 102=GR2, ...
@@ -83,9 +83,8 @@ MOISTURE_MAX = 3.0
 NONBURNABLE_CODES = {0, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99}
 
 # =========================
-# END CONFIG
+# SCRIPT
 # =========================
-
 
 import math
 import csv
@@ -374,7 +373,6 @@ def main() -> None:
     print("Done.")
     print(f"ROS (m/min): {ROS_OUT_PATH}")
     print(f"Flame length (m): {FL_OUT_PATH}")
-
 
 if __name__ == "__main__":
     main()
