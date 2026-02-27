@@ -1,2 +1,3 @@
 .venv
-data/dem_source
+data
+qgis

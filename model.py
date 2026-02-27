@@ -2,9 +2,9 @@
 Rothermel surface fire ROS + flame length rasters using:
 - DEM (for slope/aspect)
 - LANDFIRE FBFM40 fuel model raster
-- Wind speed raster
-- Wind direction raster
-- Fuel moisture raster (single band)
+- Constant wind speed
+- Constant wind direction
+- Constant fuel moisture
 
 Uses the Pyretechnics library implementation of:
 - Scott & Burgan (2005) standard fire behavior fuel models (FBFM40)
@@ -23,27 +23,29 @@ See docs example in section 5.2.3. :contentReference[oaicite:2]{index=2}
 # =========================
 # CONFIG — edit these paths
 # =========================
-DEM_PATH          = r"C:\path\to\dem.tif"
-FUEL_MODEL_PATH   = r"C:\path\to\landfire_fbfm40.tif"      # integer codes like 101=GR1, 102=GR2, ...
-WIND_SPEED_PATH   = r"C:\path\to\wind_speed.tif"
-WIND_DIR_PATH     = r"C:\path\to\wind_dir.tif"
-FUEL_MOISTURE_PATH= r"C:\path\to\fuel_moisture.tif"
+DEM_PATH          = r"data\dem_processed\dem_resampled.tif"
+FUEL_MODEL_PATH   = r"data\LF\LF_aoi.tif"      # integer codes like 101=GR1, 102=GR2, ...
+MODEL_PARAMETERS_CSV_PATH = r"model_parameters_scott_and_burgan_2005.csv"
 
-ROS_OUT_PATH      = r"C:\path\to\ros_m_min.tif"            # Pyretechnics spread rate is in m/min
-FL_OUT_PATH       = r"C:\path\to\flame_length_m.tif"       # meters
+ROS_OUT_PATH      = r"outputs\ros.tif"            # Pyretechnics spread rate is in m/min
+FL_OUT_PATH       = r"outputs\flame_length_m.tif"       # meters
 
 # =========================
 # CONFIG — units/conventions
 # =========================
-# Wind speed raster units:
+# Wind speed constant units:
 #   "mps" = meters/second
 #   "kmhr" = km/hour
 #   "mph" = miles/hour
 WIND_SPEED_UNITS = "mps"
 
+# Constant wind inputs for all pixels
+WIND_SPEED_CONSTANT = 10.0      # interpreted using WIND_SPEED_UNITS
+WIND_DIRECTION_CONSTANT = 270.0  # degrees clockwise from North
+
 # Wind direction convention:
-#   If your raster stores "direction wind is coming FROM" (meteorological, common): set True
-#   If it stores "direction wind is blowing TO": set False
+#   If WIND_DIRECTION_CONSTANT is "direction wind is coming FROM" (meteorological, common): set True
+#   If WIND_DIRECTION_CONSTANT is "direction wind is blowing TO": set False
 WIND_DIR_IS_FROM = True
 
 # Wind direction is assumed degrees clockwise from North (0=N, 90=E).
@@ -54,10 +56,13 @@ WIND_DIR_IS_FROM = True
 #   "percent"  = 8 means 8%
 MOISTURE_UNITS = "fraction"
 
+# Constant moisture input (interpreted using MOISTURE_UNITS)
+FUEL_MOISTURE_CONSTANT = 0.08
+
 # =========================
-# CONFIG — how to expand ONE moisture raster into the 6-part tuple
+# CONFIG — how to expand ONE moisture value into the 6-part tuple
 # =========================
-# You only have one moisture raster; Pyretechnics/Rothermel needs 6 moistures.
+# You only have one moisture value; Pyretechnics/Rothermel needs 6 moistures.
 # Common pragmatic approach: treat the raster as dead 1-hr moisture, and scale others.
 DEAD_10HR_MULT  = 1.5
 DEAD_100HR_MULT = 2.0
@@ -83,11 +88,65 @@ NONBURNABLE_CODES = {0, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99}
 
 
 import math
+import csv
 import numpy as np
 import rasterio
 import pyretechnics.conversion as conv
 import pyretechnics.fuel_models as fm
 import pyretechnics.surface_fire as sf
+
+fuel_model_codes = {
+    91:  "NB1",
+    93:  "NB3",
+    98:  "NB8",
+    99:  "NB9",
+    101: "GR1",
+    102: "GR2",
+    103: "GR3",
+    121: "GS1",
+    122: "GS2",
+    141: "SH1",
+    142: "SH2",
+    143: "SH3",
+    144: "SH4",
+    145: "SH5",
+    146: "SH6",
+    147: "SH7",
+    161: "TU1",
+    162: "TU2",
+    163: "TU3",
+    165: "TU5",
+    181: "TL1",
+    182: "TL2",
+    183: "TL3",
+    184: "TL4",
+    185: "TL5",
+    186: "TL6",
+    187: "TL7",
+    188: "TL8",
+    189: "TL9",
+    201: "SB1",
+    202: "SB2",
+}
+
+EXPECTED_MODEL_PARAMETER_COLUMNS = (
+    "fuel model number",
+    "fuel model code",
+    "1-hr fuel load",
+    "10-hr fuel load",
+    "100-hr fuel load",
+    "live herb fuel load",
+    "live woody fuel load",
+    "fuel model type",
+    "1-hr surface area/vol ratio",
+    "herb. surface area/vol ratio",
+    "live woody surface area/vol ratio",
+    "Fuel Bed Depth",
+    "Dead fuel moisture of Ext.",
+    "dead fuel heat content",
+    "live fuel heat content",
+    "fuel model name",
+)
 
 
 def _write_like(src_profile: dict, out_path: str, arr: np.ndarray, nodata: float = -9999.0) -> None:
@@ -127,6 +186,19 @@ def _slope_aspect_from_dem(dem_m: np.ndarray, transform) -> tuple[np.ndarray, np
     aspect_deg = np.degrees(aspect_rad).astype("float32")
 
     return slope_rise_run, aspect_deg
+
+
+def _validate_model_parameter_csv_headers(csv_path: str) -> None:
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+
+    missing = [col for col in EXPECTED_MODEL_PARAMETER_COLUMNS if col not in headers]
+    if missing:
+        raise ValueError(
+            "Model parameter CSV is missing required columns: "
+            f"{missing}. Found columns: {headers}"
+        )
 
 
 def _wind_speed_to_m_min(ws: np.ndarray) -> np.ndarray:
@@ -174,13 +246,17 @@ def _moisture_tuple_from_one_raster(m: np.ndarray) -> tuple[np.ndarray, np.ndarr
 
 
 def main() -> None:
+    _validate_model_parameter_csv_headers(MODEL_PARAMETERS_CSV_PATH)
+
     with rasterio.open(DEM_PATH) as dem_src, \
-         rasterio.open(FUEL_MODEL_PATH) as fm_src, \
-         rasterio.open(WIND_SPEED_PATH) as ws_src, \
-         rasterio.open(WIND_DIR_PATH) as wd_src, \
-         rasterio.open(FUEL_MOISTURE_PATH) as moist_src:
+         rasterio.open(FUEL_MODEL_PATH) as fm_src:
 
         profile = dem_src.profile
+
+        if dem_src.count != 1:
+            raise ValueError(f"DEM must contain exactly 1 band of elevation values; found {dem_src.count} bands.")
+        if fm_src.count != 1:
+            raise ValueError(f"Fuel model raster must contain exactly 1 band of ID values; found {fm_src.count} bands.")
 
         # Quick sanity checks
         if (dem_src.width, dem_src.height) != (fm_src.width, fm_src.height):
@@ -190,22 +266,22 @@ def main() -> None:
 
         dem = dem_src.read(1).astype("float32")
         fuel_model = fm_src.read(1).astype("int32")
-        wind_speed = ws_src.read(1).astype("float32")
-        wind_dir = wd_src.read(1).astype("float32")
-        moist = moist_src.read(1).astype("float32")
+        moist = np.full(dem.shape, FUEL_MOISTURE_CONSTANT, dtype="float32")
 
         # Nodata mask (combine)
         def bad(a: np.ndarray) -> np.ndarray:
             return ~np.isfinite(a) | (a <= -1e20)
 
-        nodata_mask = bad(dem) | bad(wind_speed) | bad(wind_dir) | bad(moist)
+        nodata_mask = bad(dem) | (fuel_model <= 0)
 
         # Compute terrain
         slope_rise_run, aspect_deg = _slope_aspect_from_dem(dem, dem_src.transform)
 
-        # Convert wind inputs
-        midflame_wind_m_min = _wind_speed_to_m_min(wind_speed)
-        upwind_deg = _upwind_dir_deg(wind_dir)
+        # Constant wind inputs across raster
+        wind_speed_const = np.full(dem.shape, WIND_SPEED_CONSTANT, dtype="float32")
+        wind_dir_const = np.full(dem.shape, WIND_DIRECTION_CONSTANT, dtype="float32")
+        midflame_wind_m_min = _wind_speed_to_m_min(wind_speed_const)
+        upwind_deg = _upwind_dir_deg(wind_dir_const)
 
         # Expand moisture
         d1, d10, d100, dherb, lherb, lwood = _moisture_tuple_from_one_raster(moist)
@@ -214,17 +290,32 @@ def main() -> None:
         ros = np.full(dem.shape, np.nan, dtype="float32")  # m/min
         flame = np.full(dem.shape, np.nan, dtype="float32")  # m
 
+        nonburnable_ids: set[int] = set()
+        unmapped_ids: set[int] = set()
+        lookup_failed_ids: set[int] = set()
+        processed_ids: set[int] = set()
+
         # Compute per unique fuel model code (fast-ish, avoids per-pixel Python loops)
         unique_codes = np.unique(fuel_model[~nodata_mask])
         for code in unique_codes:
-            if int(code) in NONBURNABLE_CODES:
+            fuel_id = int(code)
+            if fuel_id in NONBURNABLE_CODES:
+                nonburnable_ids.add(fuel_id)
+                continue
+
+            fuel_model_code = fuel_model_codes.get(fuel_id)
+            if fuel_model_code is None:
+                unmapped_ids.add(fuel_id)
                 continue
 
             try:
-                base_fuel = fm.get_fuel_model(int(code))
+                base_fuel = fm.get_fuel_model(fuel_id)
             except Exception:
                 # Unknown/unhandled fuel model code: leave as nodata
+                lookup_failed_ids.add(fuel_id)
                 continue
+
+            processed_ids.add(fuel_id)
 
             sel = (fuel_model == code) & (~nodata_mask)
             if not np.any(sel):
@@ -267,6 +358,15 @@ def main() -> None:
 
                 ros[r, c] = float(sf_max["max_spread_rate"])       # m/min :contentReference[oaicite:5]{index=5}
                 flame[r, c] = float(sf_max["max_flame_length"])    # m :contentReference[oaicite:6]{index=6}
+
+        print("Fuel ID summary:")
+        print(f"  unique IDs in raster (valid area): {len(unique_codes)}")
+        print(f"  processed IDs: {len(processed_ids)}")
+        print(f"  nonburnable IDs skipped: {len(nonburnable_ids)} -> {sorted(nonburnable_ids)}")
+        if unmapped_ids:
+            print(f"  WARNING: unmapped IDs skipped: {len(unmapped_ids)} -> {sorted(unmapped_ids)}")
+        if lookup_failed_ids:
+            print(f"  WARNING: lookup-failed IDs skipped: {len(lookup_failed_ids)} -> {sorted(lookup_failed_ids)}")
 
         _write_like(profile, ROS_OUT_PATH, ros)
         _write_like(profile, FL_OUT_PATH, flame)
